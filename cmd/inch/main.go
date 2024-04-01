@@ -89,6 +89,7 @@ func (m *Main) ParseFlags(args []string) error {
 	fs.DurationVar(&m.inch.Delay, "delay", 0, "Delay between writes")
 	fs.DurationVar(&m.inch.TargetMaxLatency, "target-latency", 0, "If set inch will attempt to adapt write delay to meet target")
 	fs.BoolVar(&m.inch.Gzip, "gzip", false, "Use gzip compression")
+	fs.BoolVar(&m.inch.CnosDB, "cnosdb", false, "Writing into CnosDB")
 	noSetup := fs.Bool("no-setup", false, "Don't ping or set up tables/buckets on run (this is useful for load testing kapacitor)")
 
 	if err := fs.Parse(args); err != nil {

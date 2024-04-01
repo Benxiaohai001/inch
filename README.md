@@ -56,6 +56,8 @@ Usage of inch:
   -time duration
     	Time span to spread writes over
   -v	Verbose
+  -cnosdb
+        Writing to CnosDB
 ```
 
 The `-t` flag specifies the number of tags and the cardinality by using a

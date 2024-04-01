@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/influxdata/inch/cnosdb"
 	"io"
 	"io/ioutil"
 	"math"
@@ -99,6 +100,7 @@ type Simulator struct {
 	BatchSize        int
 	TargetMaxLatency time.Duration
 	Gzip             bool
+	CnosDB           bool
 
 	Database      string
 	ShardDuration string        // Set a custom shard duration.
@@ -156,12 +158,17 @@ func (s *Simulator) Validate() error {
 	// validate reporting client is accessable
 	if s.ReportHost != "" {
 		var err error
-		s.clt, err = client.NewHTTPClient(client.HTTPConfig{
+		var httpConfig = client.HTTPConfig{
 			Addr:               s.ReportHost,
 			Username:           s.ReportUser,
 			Password:           s.ReportPassword,
 			InsecureSkipVerify: true,
-		})
+		}
+		if s.CnosDB {
+			s.clt, err = cnosdb.NewClient(httpConfig)
+		} else {
+			s.clt, err = client.NewHTTPClient(httpConfig)
+		}
 		if err != nil {
 			el = append(el, fmt.Errorf("failed to communicate with %q: %s", s.ReportHost, err))
 			return el
@@ -175,6 +182,11 @@ func (s *Simulator) Validate() error {
 
 	if len(el) > 0 {
 		return el
+	}
+
+	if s.CnosDB {
+		s.SetupFn = cnosdbSetupFn
+		s.WriteBatch = cnosdbWriteBatch
 	}
 
 	return nil
@@ -208,6 +220,9 @@ func (s *Simulator) Run(ctx context.Context) error {
 	fmt.Fprintf(s.Stdout, "Write Consistency: %s\n", s.Consistency)
 	fmt.Fprintf(s.Stdout, "Writing into InfluxDB 2.0: %t\n", s.V2)
 	fmt.Fprintf(s.Stdout, "InfluxDB 2.0 Authorization Token: %s\n", s.Token)
+	if s.CnosDB {
+		fmt.Fprintln(s.Stdout, "Writing to CnosDB")
+	}
 
 	if s.V2 == true && s.Token == "" {
 		fmt.Println("ERROR: Need to provide a token in ordere to write into InfluxDB 2.0")
@@ -725,6 +740,45 @@ var defaultSetupFn = func(s *Simulator) error {
 	return nil
 }
 
+var cnosdbSetupFn = func(s *Simulator) error {
+	// Validate that we can connect to the test host
+	resp, err := s.writeClient.Get(strings.TrimSuffix(s.Host, "/") + "/api/v1/ping")
+	if err != nil {
+		return fmt.Errorf("unable to connect to %q: %s", s.Host, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	s.ReportTags["build"] = "cnosdb"
+
+	var pingResp = &cnosdb.PingResponse{}
+	if err := json.Unmarshal(body, pingResp); err != nil {
+		return err
+	}
+	s.ReportTags["version"] = pingResp.Version
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/sql", s.Host), strings.NewReader("CREATE DATABASE "+s.Database+" WITH TTL '"+s.ShardDuration+"'"))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "")
+	if s.User != "" && s.Password != "" {
+		req.SetBasicAuth(s.User, s.Password)
+	}
+	resp, err = s.writeClient.Do(req)
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
 // defaultWriteBatch is the default implementation of the WriteBatch function.
 // It's the caller's responsibility to close the response body.
 var defaultWriteBatch = func(s *Simulator, buf []byte) (statusCode int, body io.ReadCloser, err error) {
@@ -763,6 +817,32 @@ var defaultWriteBatch = func(s *Simulator, buf []byte) (statusCode int, body io.
 	return resp.StatusCode, resp.Body, nil
 }
 
+var cnosdbWriteBatch = func(s *Simulator, buf []byte) (statusCode int, body io.ReadCloser, err error) {
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/write?db=%s&precision=ns", s.Host, s.Database), bytes.NewReader(buf))
+	if err != nil {
+		return 0, nil, err
+	}
+
+	req.Header.Set("Content-Type", "")
+	if s.Gzip {
+		req.Header.Set("Content-Encoding", "gzip")
+		req.Header.Set("Content-Length", strconv.Itoa(len(buf)))
+	}
+
+	if s.User != "" && s.Password != "" {
+		req.SetBasicAuth(s.User, s.Password)
+	}
+
+	resp, err := s.writeClient.Do(req)
+	if err != nil {
+		if strings.Contains(err.Error(), "connection refused") {
+			return 0, nil, ErrConnectionRefused
+		}
+		return 0, nil, err
+	}
+	return resp.StatusCode, resp.Body, nil
+}
+
 // sendBatch writes a batch to the server. Continually retries until successful.
 func (s *Simulator) sendBatch(buf []byte) error {
 	// Don't send the batch anywhere..
@@ -778,7 +858,7 @@ func (s *Simulator) sendBatch(buf []byte) error {
 	}
 
 	// Return body as error if unsuccessful.
-	if code != 204 {
+	if (s.CnosDB && code != 200) || (!s.CnosDB && code != 204) {
 		s.mu.Lock()
 		s.currentErrors++
 		s.totalErrors++
